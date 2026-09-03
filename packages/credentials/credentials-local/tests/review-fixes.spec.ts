@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { credentialKey, credentialRef } from '@deepseek-ai/dsh-credentials'
+import type { CredentialKey, CredentialRecord, CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { LocalCredentialProvider } from '../src/index.ts'
 
 function writeCredentials(file: string, text: string): Promise<void> {
@@ -176,3 +177,63 @@ describe('document editor', () => {
     expect(await reread.credentials.resolve(INNER)).toBeUndefined()
   })
 })
+
+describe('render key guard', () => {
+  const RECORD: CredentialRecord = { kind: 'api-key' }
+  // The corruption this guard exists for arrived from a JavaScript plugin that
+  // passed a plain object where the seam brands a string; every such write
+  // minted a fresh complex mapping key until the document stopped parsing.
+  const OBJECT_KEY = { ns: 'agentrouter-pool', kind: 'state', id: 'route' } as unknown as CredentialKey
+  const OBJECT_REF = { ns: 'agentrouter-pool' } as unknown as CredentialRef
+
+  it('refuses a record write under a non-string key without touching the document', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const seed = 'version: 1\nrefs:\n  DSH_REVIEW_ALPHA: one\n'
+    await writeCredentials(path, seed)
+    const ctx = await boot({ path, watch: false })
+    // Twice: the bug grew the document by one unmappable pair per write, so
+    // the regression is two refused attempts leaving the bytes identical.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(ctx.credentials.modifyRecord(OBJECT_KEY, () => Promise.resolve(RECORD)))
+        .rejects.toThrow(/storable credential key/)
+    }
+    expect(await readFile(path, 'utf8')).toBe(seed)
+  })
+
+  it('refuses a reference write under a non-string ref without touching the document', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const seed = 'version: 1\nrefs:\n  DSH_REVIEW_ALPHA: one\n'
+    await writeCredentials(path, seed)
+    const ctx = await boot({ path, watch: false })
+    await expect(ctx.credentials.set(OBJECT_REF, 'value')).rejects.toThrow(/storable credential reference/)
+    expect(await readFile(path, 'utf8')).toBe(seed)
+  })
+
+  it('refuses a well-typed string outside the stored grammar', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const seed = 'version: 1\nrefs:\n  DSH_REVIEW_ALPHA: one\n'
+    await writeCredentials(path, seed)
+    const ctx = await boot({ path, watch: false })
+    await expect(ctx.credentials.set('not a ref' as CredentialRef, 'value')).rejects.toThrow(/storable credential reference/)
+    await expect(ctx.credentials.modifyRecord('a/b/c' as unknown as CredentialKey, () => Promise.resolve(RECORD)))
+      .rejects.toThrow(/storable credential key/)
+    await expect(ctx.credentials.modifyRecord('no-segment' as unknown as CredentialKey, () => Promise.resolve(RECORD)))
+      .rejects.toThrow(/storable credential key/)
+    expect(await readFile(path, 'utf8')).toBe(seed)
+  })
+
+  it('still stores everything the grammar admits', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const ctx = await boot({ path, watch: false })
+    await ctx.credentials.set(ALPHA, 'two')
+    await ctx.credentials.modifyRecord(credentialKey('llm-pi-ai', 'openai-codex'), () => Promise.resolve(RECORD))
+    const reread = await boot({ path, watch: false })
+    expect(await reread.credentials.resolve(ALPHA)).toEqual({ value: 'two', source: 'file' })
+    expect(await reread.credentials.readRecord(credentialKey('llm-pi-ai', 'openai-codex'))).toEqual(RECORD)
+  })
+})
+

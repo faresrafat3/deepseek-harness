@@ -44,7 +44,7 @@ import { Document, isMap, isScalar, parseDocument, type YAMLError } from 'yaml'
 import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { canonicalizeWatchPath, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
-import { CredentialProvider, credentialRef, parseCredentialKey } from '@deepseek-ai/dsh-credentials'
+import { CredentialProvider, credentialRef, isCredentialKeySegment, isCredentialRefName, parseCredentialKey } from '@deepseek-ai/dsh-credentials'
 import type {
   ApiKeyRecord,
   CredentialInfo,
@@ -440,7 +440,45 @@ function mutableDocument(text: string | undefined): Document {
  * @param value - the new value, or `undefined` to delete the key.
  * @returns the text to persist.
  */
+/** How a refused key reads in an error message; `[object Object]` for the object that prompted this guard. */
+function describeKeySlot(value: unknown): string {
+  return typeof value === 'string' ? `"${value}"` : `a non-string value (${String(value)})`
+}
+
+/**
+ * Re-prove the reference grammar at the render boundary. A branded ref is a
+ * string by construction, but this module is reachable from JavaScript, where
+ * any value can arrive in a branded slot; the yaml tree admits a non-string as
+ * a complex mapping key — a distinct key on every write — so a document
+ * written that way grows until no boot can parse it. Refusing here keeps the
+ * writable language inside the language the read path admits.
+ * @param ref - the value a caller put in a branded reference slot.
+ */
+function assertRenderableRef(ref: CredentialRef): void {
+  if (typeof ref !== 'string' || !isCredentialRefName(ref)) {
+    throw new TypeError(
+      `credentials-local: ${describeKeySlot(ref)} is not a storable credential reference; refusing to render it into the document`,
+    )
+  }
+}
+
+/**
+ * The key half of the same re-proof: a storable key is exactly two
+ * lowercase hyphenated segments joined by `/`, because that is the only key
+ * shape the next boot's parse will admit.
+ * @param key - the value a caller put in a branded key slot.
+ */
+function assertRenderableKey(key: CredentialKey): void {
+  const segments = typeof key === 'string' ? key.split('/') : undefined
+  if (segments === undefined || segments.length !== 2 || !segments.every(isCredentialKeySegment)) {
+    throw new TypeError(
+      `credentials-local: ${describeKeySlot(key)} is not a storable credential key ("<scope>/<id>"); refusing to render it into the document`,
+    )
+  }
+}
+
 function renderRef(text: string | undefined, ref: CredentialRef, value: string | undefined): string {
+  assertRenderableRef(ref)
   const document = mutableDocument(text)
   if (value === undefined) deleteSectionEntry(document, 'refs', ref)
   else document.setIn(['refs', ref], value)
@@ -457,6 +495,7 @@ function renderRef(text: string | undefined, ref: CredentialRef, value: string |
  * @returns the text to persist.
  */
 function renderRecord(text: string | undefined, key: CredentialKey, record: CredentialRecord | undefined): string {
+  assertRenderableKey(key)
   const document = mutableDocument(text)
   if (record === undefined) deleteSectionEntry(document, 'records', key)
   else document.setIn(['records', key], record)
