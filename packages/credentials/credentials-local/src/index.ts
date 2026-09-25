@@ -46,7 +46,6 @@ import { canonicalizeWatchPath, resolveDshHome } from '@deepseek-ai/dsh-home-pat
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { CredentialProvider, credentialRef, isCredentialKeySegment, isCredentialRefName, parseCredentialKey } from '@deepseek-ai/dsh-credentials'
 import type {
-  ApiKeyRecord,
   CredentialInfo,
   CredentialKey,
   CredentialRecord,
@@ -296,24 +295,87 @@ function parseRecords(section: unknown, filename: string): Map<string, Credentia
   return entries
 }
 
+/** Whether a value is a plain mapping that the YAML document can represent as an object. */
+function isPlainMapping(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+/**
+ * Reject fields the record tag does not define before a mutation can render
+ * them into a document that the read path would refuse.
+ * @param key - the record's credential key, for the failure message.
+ * @param fields - the candidate record fields.
+ * @param allowed - the fields admitted by the record tag.
+ */
+function assertStorableFields(key: CredentialKey, fields: Record<string, unknown>, allowed: string[]): void {
+  for (const field of Object.keys(fields)) {
+    if (!allowed.includes(field)) {
+      throw new TypeError(`credentials-local: record "${key}" has unknown field "${field}"`)
+    }
+  }
+}
+
 /**
  * Refuse an api-key record the read path could not admit, before it is
- * rendered: an empty key, an env name outside the reference grammar, or an
- * empty env value would persist a document `parseRecord` rejects at the next
- * boot — a durable-boundary write is validated where it is written.
+ * rendered: an empty or non-string key, a non-mapping environment, an env
+ * name outside the reference grammar, or an empty/non-string env value would
+ * persist a document `parseRecord` rejects at the next boot.
  * @param key - the record's credential key, for the failure message.
- * @param record - the api-key record a mutation returned.
+ * @param fields - the api-key record fields to admit.
  */
-function assertStorableApiKey(key: CredentialKey, record: ApiKeyRecord): void {
-  if (record.key !== undefined && record.key.length === 0) {
-    throw new TypeError(`credentials-local: record "${key}" has an empty key; omit the field instead`)
+function assertStorableApiKey(key: CredentialKey, fields: Record<string, unknown>): void {
+  const secret = fields['key']
+  if (secret !== undefined && (typeof secret !== 'string' || secret.length === 0)) {
+    throw new TypeError(`credentials-local: record "${key}" has a non-string or empty key`)
   }
-  for (const [name, value] of Object.entries(record.env ?? {})) {
+  const env = fields['env']
+  if (env === undefined) return
+  if (!isPlainMapping(env)) {
+    throw new TypeError(`credentials-local: record "${key}" has a non-mapping env`)
+  }
+  for (const [name, value] of Object.entries(env)) {
     credentialRef(name)
-    if (value.length === 0) {
+    if (typeof value !== 'string' || value.length === 0) {
       throw new TypeError(`credentials-local: record "${key}" env "${name}" must be a non-empty string`)
     }
   }
+}
+
+/** Describe a record tag without coercing an untrusted value into a diagnostic. */
+function describeKind(value: unknown): string {
+  return typeof value === 'string' ? JSON.stringify(value) : typeof value
+}
+
+/**
+ * Admit a record shape that the document parser can read back. The public
+ * TypeScript union is not sufficient at this durable boundary because a
+ * JavaScript caller can put an arbitrary value in the mutation result.
+ * @param key - the record's credential key, for the failure message.
+ * @param record - the candidate record returned by a mutation.
+ */
+function assertStorableRecord(key: CredentialKey, record: unknown): asserts record is CredentialRecord {
+  if (!isPlainMapping(record)) {
+    throw new TypeError(`credentials-local: record "${key}" must be a mapping`)
+  }
+  const fields = record
+  const kind = fields['kind']
+  if (kind === 'api-key') {
+    assertStorableFields(key, fields, ['kind', 'key', 'env'])
+    assertStorableApiKey(key, fields)
+    return
+  }
+  if (kind === 'grant') {
+    assertStorableFields(key, fields, ['kind', 'payload'])
+    if (!Object.hasOwn(fields, 'payload')) {
+      throw new Error(`credentials-local: record "${key}" has no payload`)
+    }
+    assertJsonValue(`record "${key}" payload`, fields['payload'], new Set())
+    return
+  }
+  if (kind === undefined) throw new Error(`credentials-local: record "${key}" has no kind`)
+  throw new Error(`credentials-local: record "${key}" has unknown kind ${describeKind(kind)}`)
 }
 
 /** One section of the document as a plain mapping; absent and null both mean empty. */
@@ -354,7 +416,7 @@ function parseRecord(key: string, value: unknown, filename: string): CredentialR
     return { kind: 'grant', payload: fields['payload'] }
   }
   if (kind === undefined) throw new Error(`credentials-local: record "${key}" in ${filename} has no kind`)
-  throw new Error(`credentials-local: record "${key}" in ${filename} has unknown kind ${JSON.stringify(kind)}`)
+  throw new Error(`credentials-local: record "${key}" in ${filename} has unknown kind ${describeKind(kind)}`)
 }
 
 /** Reject a field the tag does not define, so a typo is not silently dropped. */
@@ -433,16 +495,22 @@ function mutableDocument(text: string | undefined): Document {
   return document
 }
 
-/**
- * Render the next document text with one reference set or deleted.
- * @param text - the current document text, `undefined` while the file is absent.
- * @param ref - the reference to write.
- * @param value - the new value, or `undefined` to delete the key.
- * @returns the text to persist.
- */
-/** How a refused key reads in an error message; `[object Object]` for the object that prompted this guard. */
+/** How a refused key reads in an error message without coercing an untrusted value. */
 function describeKeySlot(value: unknown): string {
-  return typeof value === 'string' ? `"${value}"` : `a non-string value (${String(value)})`
+  if (typeof value === 'string') return JSON.stringify(value)
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'an array'
+  return `a non-string value (${typeof value})`
+}
+
+/** Reject a reference value the document parser could not read back. */
+function assertStorableRefValue(value: unknown): asserts value is string {
+  if (typeof value !== 'string') {
+    throw new TypeError('credentials-local: credential values must be strings')
+  }
+  if (value.length === 0) {
+    throw new Error('credentials-local: an empty value cannot be stored; use unset')
+  }
 }
 
 /**
@@ -477,8 +545,16 @@ function assertRenderableKey(key: CredentialKey): void {
   }
 }
 
+/**
+ * Render the next document text with one reference set or deleted.
+ * @param text - the current document text, `undefined` while the file is absent.
+ * @param ref - the reference to write.
+ * @param value - the new value, or `undefined` to delete the key.
+ * @returns the text to persist.
+ */
 function renderRef(text: string | undefined, ref: CredentialRef, value: string | undefined): string {
   assertRenderableRef(ref)
+  if (value !== undefined) assertStorableRefValue(value)
   const document = mutableDocument(text)
   if (value === undefined) deleteSectionEntry(document, 'refs', ref)
   else document.setIn(['refs', ref], value)
@@ -496,6 +572,7 @@ function renderRef(text: string | undefined, ref: CredentialRef, value: string |
  */
 function renderRecord(text: string | undefined, key: CredentialKey, record: CredentialRecord | undefined): string {
   assertRenderableKey(key)
+  if (record !== undefined) assertStorableRecord(key, record)
   const document = mutableDocument(text)
   if (record === undefined) deleteSectionEntry(document, 'records', key)
   else document.setIn(['records', key], record)
@@ -678,9 +755,8 @@ export class LocalCredentialProvider extends CredentialProvider {
   }
 
   override async set(ref: CredentialRef, value: string): Promise<void> {
-    if (value.length === 0) {
-      throw new Error(`credentials-local: an empty value cannot be stored for "${ref}"; use unset`)
-    }
+    assertRenderableRef(ref)
+    assertStorableRefValue(value)
     await this.write(ref, value)
   }
 
@@ -714,6 +790,7 @@ export class LocalCredentialProvider extends CredentialProvider {
     key: CredentialKey,
     mutate: (current: CredentialRecord | undefined) => Promise<CredentialRecord | undefined>,
   ): Promise<CredentialRecord | undefined> {
+    assertRenderableKey(key)
     if (this.isClosed()) throw new Error(`credentials-local is disposed: cannot modify "${key}"`)
     return this.enqueue(async () => {
       if (this.isClosed()) {
@@ -731,8 +808,7 @@ export class LocalCredentialProvider extends CredentialProvider {
         // Admitted before it is rendered: what the read path would refuse is
         // refused here first, so a caller can never persist a document the
         // next boot rejects, and a value refused here has not been stored.
-        if (next.kind === 'grant') assertJsonValue(`record "${key}" payload`, next.payload, new Set())
-        else assertStorableApiKey(key, next)
+        assertStorableRecord(key, next)
         const nextText = renderRecord(this.text, key, next)
         // 0600: a document holding secrets is never world-readable.
         await writeFileAtomic(this.spec.filename, nextText, { mode: 0o600, dirMode: 0o700 })
@@ -746,6 +822,7 @@ export class LocalCredentialProvider extends CredentialProvider {
   }
 
   override async deleteRecord(key: CredentialKey): Promise<void> {
+    assertRenderableKey(key)
     if (this.isClosed()) throw new Error(`credentials-local is disposed: cannot delete "${key}"`)
     await this.enqueue(async () => {
       if (this.isClosed()) {
@@ -790,6 +867,7 @@ export class LocalCredentialProvider extends CredentialProvider {
 
   /** Queue one line edit; entry checks reject early, the queue re-judges them at run time. */
   private async write(ref: CredentialRef, value: string | undefined): Promise<void> {
+    assertRenderableRef(ref)
     const verb = value === undefined ? 'unset' : 'set'
     if (this.isClosed()) {
       throw new Error(`credentials-local is disposed: cannot ${verb} "${ref}"`)
@@ -831,6 +909,7 @@ export class LocalCredentialProvider extends CredentialProvider {
    * provider resolves ranks below the document being written.
    */
   private assertUnshadowed(ref: CredentialRef, verb: 'set' | 'unset'): void {
+    assertRenderableRef(ref)
     if (this.inherited(ref) !== undefined) {
       throw new Error(
         `credentials-local: "${ref}" is supplied read-only by the launching environment, so ${verb} would be`

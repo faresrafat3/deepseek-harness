@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { credentialKey, credentialRef } from '@deepseek-ai/dsh-credentials'
+import { DSH_LAUNCH_ENVIRONMENT_KEY } from '@deepseek-ai/dsh-launch-environment'
 import type { CredentialKey, CredentialRecord, CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { LocalCredentialProvider } from '../src/index.ts'
 
@@ -192,12 +193,14 @@ describe('render key guard', () => {
     const seed = 'version: 1\nrefs:\n  DSH_REVIEW_ALPHA: one\n'
     await writeCredentials(path, seed)
     const ctx = await boot({ path, watch: false })
+    const mutate = vi.fn(() => Promise.resolve(RECORD))
     // Twice: the bug grew the document by one unmappable pair per write, so
     // the regression is two refused attempts leaving the bytes identical.
     for (let attempt = 0; attempt < 2; attempt++) {
-      await expect(ctx.credentials.modifyRecord(OBJECT_KEY, () => Promise.resolve(RECORD)))
+      await expect(ctx.credentials.modifyRecord(OBJECT_KEY, mutate))
         .rejects.toThrow(/storable credential key/)
     }
+    expect(mutate).not.toHaveBeenCalled()
     expect(await readFile(path, 'utf8')).toBe(seed)
   })
 
@@ -220,9 +223,79 @@ describe('render key guard', () => {
     await expect(ctx.credentials.set('not a ref' as CredentialRef, 'value')).rejects.toThrow(/storable credential reference/)
     await expect(ctx.credentials.modifyRecord('a/b/c' as unknown as CredentialKey, () => Promise.resolve(RECORD)))
       .rejects.toThrow(/storable credential key/)
+    await expect(ctx.credentials.modifyRecord('a/B' as unknown as CredentialKey, () => Promise.resolve(RECORD)))
+      .rejects.toThrow(/storable credential key/)
     await expect(ctx.credentials.modifyRecord('no-segment' as unknown as CredentialKey, () => Promise.resolve(RECORD)))
       .rejects.toThrow(/storable credential key/)
     expect(await readFile(path, 'utf8')).toBe(seed)
+  })
+
+  it('rejects an invalid key before an absent delete can no-op', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const ctx = await boot({ path, watch: false })
+
+    await expect(ctx.credentials.deleteRecord(OBJECT_KEY)).rejects.toThrow(/storable credential key/)
+    await expect(readFile(path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('does not coerce untrusted key values in refusal diagnostics', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const ctx = await boot({ path, watch: false })
+    const values: unknown[] = [
+      Object.create(null),
+      { toString: () => { throw new Error('must not run') } },
+    ]
+
+    for (const value of values) {
+      await expect(ctx.credentials.set(value as CredentialRef, 'value')).rejects.toThrow(/non-string value/)
+    }
+    await expect(readFile(path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('rejects a non-string reference value before creating a document', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const ctx = await boot({ path, watch: false })
+
+    await expect(ctx.credentials.set(ALPHA, 123 as unknown as string)).rejects.toThrow(/values must be strings/)
+    await expect(readFile(path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('refuses record values the parser could not read back', async () => {
+    const candidates: unknown[] = [
+      { kind: 'api-key', key: 123 },
+      { kind: 'api-key', env: [] },
+      { kind: 'api-key', env: { AWS_PROFILE: 123 } },
+      { kind: 'grant', payload: 1, extra: true },
+      { kind: 'not-a-record-kind' },
+    ]
+
+    for (const candidate of candidates) {
+      const dir = await tempDir()
+      const path = join(dir, '.credentials.yaml')
+      const ctx = await boot({ path, watch: false })
+      await expect(ctx.credentials.modifyRecord(
+        credentialKey('llm-pi-ai', 'validation'),
+        () => Promise.resolve(candidate as CredentialRecord),
+      )).rejects.toThrow(/record "llm-pi-ai\/validation"/)
+      await expect(readFile(path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    }
+  })
+
+  it('validates a reference before consulting the launch environment', async () => {
+    const dir = await tempDir()
+    const path = join(dir, '.credentials.yaml')
+    const ctx = new Context()
+    const getFrom = vi.fn(() => { throw new Error('environment lookup must not run') })
+    ctx.provide(DSH_LAUNCH_ENVIRONMENT_KEY, { get: vi.fn(), getFrom })
+    const fiber = ctx.plugin(LocalCredentialProvider, { path, watch: false })
+    cleanups.push(async () => { await fiber.dispose() })
+    await fiber
+
+    await expect(ctx.credentials.set(OBJECT_REF, 'value')).rejects.toThrow(/storable credential reference/)
+    expect(getFrom).not.toHaveBeenCalled()
   })
 
   it('still stores everything the grammar admits', async () => {

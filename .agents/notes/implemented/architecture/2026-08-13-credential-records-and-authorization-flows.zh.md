@@ -37,7 +37,7 @@ harness 的凭据平面只能表达一种机密：藏在某个环境变量名之
 
 `withFileLock` 接受按调用声明的等待上限。pi-ai 在 `credentials.modify()` **内部**执行 OAuth 刷新，因此记录写入路径要跨越一次网络往返持锁；2 秒的默认值是按"渲染并 rename"的量级选的，会让该文档的每一个其他写入方失败。重试节奏保持固定——那是协议常量——而等待时长按争用方可能遇到的最长持锁方来定：refs 与 records 共享同一份文件、同一把锁，因此该文档的每一个写入方（`DOCUMENT_LOCK_WAIT_MS`，含引用写入与记录删除）都要等得起一次 OAuth 刷新，而不只是执行刷新的那个 mutation。
 
-seam 的边缘与写入路径同一纪律。prompt 被拒是结果而非故障——交互实现以 `AuthorizationDeclinedError` 拒绝，尝试以 `cancelled` 结算；渲染不了 notice 的界面只丢那条 notice、绝不拖垮 flow；`authorization/settled` 按 credentials seam 的条款以遏制方式分发监听器故障。存储侧，api-key 记录在渲染前先行准入（`parseRecord` 下次启动会拒绝的，写入时就拒绝），`llm-pi-ai` 在寻址记录前先问 `isCredentialKeySegment`，任意手写路由键读作「没有存储任何东西」，而不是在解析途中抛错。
+seam 的边缘与写入路径同一纪律。prompt 被拒是结果而非故障——交互实现以 `AuthorizationDeclinedError` 拒绝，尝试以 `cancelled` 结算；渲染不了 notice 的界面只丢那条 notice、绝不拖垮 flow；`authorization/settled` 按 credentials seam 的条款以遏制方式分发监听器故障。存储侧，每个公开写入都会在查询环境、调用 mutation callback 或渲染之前，重新校验运行时 branded 的引用、值和记录形状；`parseRecord` 下次启动会拒绝的内容在写入时就会拒绝，诊断也不会强制转换不可信的 key 对象。`llm-pi-ai` 在寻址记录前先问 `isCredentialKeySegment`，任意手写路由键读作「没有存储任何东西」，而不是在解析途中抛错。
 
 撤销会结算一次尝试，无论其 flow 是否响应信号。flow 本应在信号触发时停止，但不停止的那个会把键占到进程结束，而被卡住的键从外部看与忙碌中的键无法区分。被遗弃的执行体听任其自行结束。
 

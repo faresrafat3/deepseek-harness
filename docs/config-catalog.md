@@ -536,7 +536,7 @@ export interface Config {
 }
 ```
 
-Source: [`packages/credentials/credentials-local/src/index.ts:64`](../packages/credentials/credentials-local/src/index.ts)
+Source: [`packages/credentials/credentials-local/src/index.ts:63`](../packages/credentials/credentials-local/src/index.ts)
 
 <a id="deepseek-aidsh-e2b"></a>
 
